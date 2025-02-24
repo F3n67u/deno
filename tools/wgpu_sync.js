@@ -1,24 +1,25 @@
-#!/usr/bin/env -S deno run --unstable --allow-read --allow-write --allow-run
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+#!/usr/bin/env -S deno run --unstable --allow-read --allow-write --allow-run --config=tests/config/deno.json
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-import { join, ROOT_PATH, walk } from "./util.js";
+import { join, ROOT_PATH } from "./util.js";
 
-// const COMMIT = "c00e471274b6c21acda89b4b13d41742c0285d71"; // Release 12
-const COMMIT = "c4aa3eaed020a640fec06b48f0a5ea93490d41bb"; // tip of PR (needs merge)
-const REPO = "kvark/wgpu";
-const V_WGPU = "0.12";
+const COMMIT = "4521502da69bcf4f92c8350042c268573ef216d4";
+const REPO = "gfx-rs/wgpu";
+const V_WGPU = "0.20";
 const TARGET_DIR = join(ROOT_PATH, "ext", "webgpu");
 
 async function bash(subcmd, opts = {}) {
-  const p = Deno.run({ ...opts, cmd: ["bash", "-c", subcmd] });
+  const { success, code } = await new Deno.Command("bash", {
+    ...opts,
+    args: ["-c", subcmd],
+    stdout: "inherit",
+    sdterr: "inherit",
+  }).output();
 
   // Exit process on failure
-  const { success, code } = await p.status();
   if (!success) {
     Deno.exit(code);
   }
-  // Cleanup
-  p.close();
 }
 
 async function clearTargetDir() {
@@ -36,17 +37,11 @@ async function checkoutUpstream() {
   await bash(cmd);
 }
 
-async function denoCoreVersion() {
-  const coreCargo = join(ROOT_PATH, "core", "Cargo.toml");
-  const contents = await Deno.readTextFile(coreCargo);
-  return contents.match(/^version = "(\d+\.\d+\.\d+)"$/m)[1];
-}
-
 async function denoWebgpuVersion() {
-  const coreCargo = join(ROOT_PATH, "runtime", "Cargo.toml");
+  const coreCargo = join(ROOT_PATH, "Cargo.toml");
   const contents = await Deno.readTextFile(coreCargo);
   return contents.match(
-    /^deno_webgpu = { version = "(\d+\.\d+\.\d+)", path = "..\/ext\/webgpu" }$/m,
+    /^deno_webgpu = { version = "(\d+\.\d+\.\d+)", path = ".\/ext\/webgpu" }$/m,
   )[1];
 }
 
@@ -57,62 +52,39 @@ async function patchFile(path, patcher) {
 }
 
 async function patchCargo() {
-  const vDenoCore = await denoCoreVersion();
   const vDenoWebgpu = await denoWebgpuVersion();
   await patchFile(
     join(TARGET_DIR, "Cargo.toml"),
     (data) =>
       data
         .replace(/^version = .*/m, `version = "${vDenoWebgpu}"`)
-        .replace(`edition = "2018"`, `edition = "2021"`)
         .replace(
-          /^deno_core \= .*$/gm,
-          `deno_core = { version = "${vDenoCore}", path = "../../core" }`,
+          /^repository.workspace = true/m,
+          `repository = "https://github.com/gfx-rs/wgpu"`,
         )
         .replace(
-          /^wgpu-core \= .*$/gm,
-          `wgpu-core = { version = "${V_WGPU}", features = ["trace", "replay", "serde"] }`,
+          /^serde = { workspace = true, features = ["derive"] }/m,
+          `serde.workspace = true`,
         )
         .replace(
-          /^wgpu-types \= .*$/gm,
-          `wgpu-types = { version = "${V_WGPU}", features = ["trace", "replay", "serde"] }`,
+          /^tokio = { workspace = true, features = ["full"] }/m,
+          `tokio.workspace = true`,
         ),
-    // .replace(
-    //   /^wgpu-core \= .*$/gm,
-    //   `wgpu-core = { git = "https://github.com/${REPO}", rev = "${COMMIT}", features = ["trace", "replay", "serde"] }`,
-    // )
-    // .replace(
-    //   /^wgpu-types \= .*$/gm,
-    //   `wgpu-types = { git = "https://github.com/${REPO}", rev = "${COMMIT}", features = ["trace", "replay", "serde"] }`,
-    // )
   );
-}
 
-async function patchSrcLib() {
   await patchFile(
-    join(TARGET_DIR, "src", "lib.rs"),
+    join(ROOT_PATH, "Cargo.toml"),
     (data) =>
-      data.replace(`prefix "deno:deno_webgpu",`, `prefix "deno:ext/webgpu",`),
+      data
+        .replace(/^wgpu-core = .*/m, `wgpu-core = "${V_WGPU}"`)
+        .replace(/^wgpu-types = .*/m, `wgpu-types = "${V_WGPU}"`),
   );
-}
-
-async function patchCopyrights() {
-  const walker = walk(TARGET_DIR, { includeDirs: false });
-  for await (const entry of walker) {
-    await patchFile(
-      entry.path,
-      (data) =>
-        data.replace(/^\/\/ Copyright 2018-2021/, "// Copyright 2018-2022"),
-    );
-  }
 }
 
 async function main() {
   await clearTargetDir();
   await checkoutUpstream();
   await patchCargo();
-  await patchSrcLib();
-  await patchCopyrights();
   await bash(join(ROOT_PATH, "tools", "format.js"));
 }
 

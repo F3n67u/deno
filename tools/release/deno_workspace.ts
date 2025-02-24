@@ -1,13 +1,13 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-import { path, ReleasesMdFile, Repo } from "./deps.ts";
+import { $, ReleasesMdFile, Repo } from "./deps.ts";
 
 export class DenoWorkspace {
   #repo: Repo;
 
   static get rootDirPath() {
-    const currentDirPath = path.dirname(path.fromFileUrl(import.meta.url));
-    return path.resolve(currentDirPath, "../../");
+    const currentDirPath = $.path.dirname($.path.fromFileUrl(import.meta.url));
+    return $.path.resolve(currentDirPath, "../../");
   }
 
   static async load(): Promise<DenoWorkspace> {
@@ -35,11 +35,19 @@ export class DenoWorkspace {
   getCliDependencyCrates() {
     return this.getCliCrate()
       .descendantDependenciesInRepo()
-      .filter((c) => c.name !== "test_util");
+      .filter((c) => c.name !== "test_server");
   }
 
   getCliCrate() {
     return this.getCrate("deno");
+  }
+
+  getDenoRtCrate() {
+    return this.getCrate("denort");
+  }
+
+  getDenoLibCrate() {
+    return this.getCrate("deno_lib");
   }
 
   getCrate(name: string) {
@@ -48,18 +56,13 @@ export class DenoWorkspace {
 
   getReleasesMdFile() {
     return new ReleasesMdFile(
-      path.join(DenoWorkspace.rootDirPath, "Releases.md"),
+      $.path.join(DenoWorkspace.rootDirPath, "Releases.md"),
     );
   }
 
-  runFormatter() {
-    return this.#repo.runCommandWithOutput([
-      "deno",
-      "run",
-      "--allow-write",
-      "--allow-read",
-      "--allow-run",
-      "./tools/format.js",
-    ]);
+  async runFormatter() {
+    await this.#repo.command(
+      "deno run --allow-write --allow-read --allow-net --allow-run ./tools/format.js",
+    );
   }
 }

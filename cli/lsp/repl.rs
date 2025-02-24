@@ -1,15 +1,15 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::collections::HashMap;
 
-use deno_ast::swc::common::BytePos;
-use deno_ast::swc::common::Span;
 use deno_ast::LineAndColumnIndex;
 use deno_ast::ModuleSpecifier;
 use deno_ast::SourceTextInfo;
 use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
 use deno_core::serde_json;
+use lsp_types::Uri;
+use tokio_util::sync::CancellationToken;
 use tower_lsp::lsp_types::ClientCapabilities;
 use tower_lsp::lsp_types::ClientInfo;
 use tower_lsp::lsp_types::CompletionContext;
@@ -34,15 +34,21 @@ use tower_lsp::lsp_types::WorkDoneProgressParams;
 use tower_lsp::LanguageServer;
 
 use super::client::Client;
+use super::config::ClassMemberSnippets;
 use super::config::CompletionSettings;
+use super::config::DenoCompletionSettings;
 use super::config::ImportCompletionSettings;
+use super::config::LanguageWorkspaceSettings;
+use super::config::ObjectLiteralMethodSnippets;
 use super::config::TestingSettings;
 use super::config::WorkspaceSettings;
+use super::urls::uri_parse_unencoded;
+use super::urls::url_to_uri;
 
 #[derive(Debug)]
 pub struct ReplCompletionItem {
   pub new_text: String,
-  pub span: Span,
+  pub range: std::ops::Range<usize>,
 }
 
 pub struct ReplLanguageServer {
@@ -55,7 +61,10 @@ pub struct ReplLanguageServer {
 
 impl ReplLanguageServer {
   pub async fn new_initialized() -> Result<ReplLanguageServer, AnyError> {
+    // downgrade info and warn lsp logging to debug
     super::logging::set_lsp_log_level(log::Level::Debug);
+    super::logging::set_lsp_warn_level(log::Level::Debug);
+
     let language_server =
       super::language_server::LanguageServer::new(Client::new_for_repl());
 
@@ -66,7 +75,7 @@ impl ReplLanguageServer {
       .initialize(InitializeParams {
         process_id: None,
         root_path: None,
-        root_uri: Some(cwd_uri.clone()),
+        root_uri: Some(url_to_uri(&cwd_uri).unwrap()),
         initialization_options: Some(
           serde_json::to_value(get_repl_workspace_settings()).unwrap(),
         ),
@@ -76,6 +85,8 @@ impl ReplLanguageServer {
           window: None,
           general: None,
           experimental: None,
+          offset_encoding: None,
+          notebook_document: None,
         },
         trace: None,
         workspace_folders: None,
@@ -84,6 +95,7 @@ impl ReplLanguageServer {
           version: None,
         }),
         locale: None,
+        work_done_progress_params: Default::default(),
       })
       .await?;
 
@@ -111,71 +123,78 @@ impl ReplLanguageServer {
     &mut self,
     line_text: &str,
     position: usize,
+    token: CancellationToken,
   ) -> Vec<ReplCompletionItem> {
     self.did_change(line_text).await;
-    let before_line_len = BytePos(self.document_text.len() as u32);
-    let position = before_line_len + BytePos(position as u32);
     let text_info = deno_ast::SourceTextInfo::from_string(format!(
       "{}{}",
       self.document_text, self.pending_text
     ));
+    let before_line_len = self.document_text.len();
+    let position = text_info.range().start + before_line_len + position;
     let line_and_column = text_info.line_and_column_index(position);
     let response = self
       .language_server
-      .completion(CompletionParams {
-        text_document_position: TextDocumentPositionParams {
-          text_document: TextDocumentIdentifier {
-            uri: self.get_document_specifier(),
+      .completion(
+        CompletionParams {
+          text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+              uri: self.get_document_uri(),
+            },
+            position: Position {
+              line: line_and_column.line_index as u32,
+              character: line_and_column.column_index as u32,
+            },
           },
-          position: Position {
-            line: line_and_column.line_index as u32,
-            character: line_and_column.column_index as u32,
+          work_done_progress_params: WorkDoneProgressParams {
+            work_done_token: None,
           },
+          partial_result_params: PartialResultParams {
+            partial_result_token: None,
+          },
+          context: Some(CompletionContext {
+            trigger_kind: CompletionTriggerKind::INVOKED,
+            trigger_character: None,
+          }),
         },
-        work_done_progress_params: WorkDoneProgressParams {
-          work_done_token: None,
-        },
-        partial_result_params: PartialResultParams {
-          partial_result_token: None,
-        },
-        context: Some(CompletionContext {
-          trigger_kind: CompletionTriggerKind::INVOKED,
-          trigger_character: None,
-        }),
-      })
+        token,
+      )
       .await
       .ok()
       .unwrap_or_default();
 
-    let items = match response {
+    let mut items = match response {
       Some(CompletionResponse::Array(items)) => items,
       Some(CompletionResponse::List(list)) => list.items,
       None => Vec::new(),
     };
+    items.sort_by_key(|item| {
+      if let Some(sort_text) = &item.sort_text {
+        sort_text.clone()
+      } else {
+        item.label.clone()
+      }
+    });
     items
       .into_iter()
       .filter_map(|item| {
         item.text_edit.and_then(|edit| match edit {
           CompletionTextEdit::Edit(edit) => Some(ReplCompletionItem {
             new_text: edit.new_text,
-            span: lsp_range_to_span(&text_info, &edit.range),
+            range: lsp_range_to_std_range(&text_info, &edit.range),
           }),
           CompletionTextEdit::InsertAndReplace(_) => None,
         })
       })
       .filter(|item| {
         // filter the results to only exact matches
-        let text = &text_info.text_str()
-          [item.span.lo.0 as usize..item.span.hi.0 as usize];
+        let text = &text_info.text_str()[item.range.clone()];
         item.new_text.starts_with(text)
       })
       .map(|mut item| {
         // convert back to a line position
-        item.span = Span::new(
-          item.span.lo - before_line_len,
-          item.span.hi - before_line_len,
-          Default::default(),
-        );
+        item.range.start -= before_line_len;
+        item.range.end -= before_line_len;
         item
       })
       .collect()
@@ -186,7 +205,7 @@ impl ReplLanguageServer {
     let new_text = if new_text.ends_with('\n') {
       new_text.to_string()
     } else {
-      format!("{}\n", new_text)
+      format!("{new_text}\n")
     };
     self.document_version += 1;
     let current_line_count =
@@ -197,7 +216,7 @@ impl ReplLanguageServer {
       .language_server
       .did_change(DidChangeTextDocumentParams {
         text_document: VersionedTextDocumentIdentifier {
-          uri: self.get_document_specifier(),
+          uri: self.get_document_uri(),
           version: self.document_version,
         },
         content_changes: vec![TextDocumentContentChangeEvent {
@@ -222,7 +241,7 @@ impl ReplLanguageServer {
         .language_server
         .did_close(DidCloseTextDocumentParams {
           text_document: TextDocumentIdentifier {
-            uri: self.get_document_specifier(),
+            uri: self.get_document_uri(),
           },
         })
         .await;
@@ -237,7 +256,7 @@ impl ReplLanguageServer {
       .language_server
       .did_open(DidOpenTextDocumentParams {
         text_document: TextDocumentItem {
-          uri: self.get_document_specifier(),
+          uri: self.get_document_uri(),
           language_id: "typescript".to_string(),
           version: self.document_version,
           text: format!("{}{}", self.document_text, self.pending_text),
@@ -246,23 +265,30 @@ impl ReplLanguageServer {
       .await;
   }
 
-  fn get_document_specifier(&self) -> ModuleSpecifier {
-    self.cwd_uri.join("$deno$repl.ts").unwrap()
+  fn get_document_uri(&self) -> Uri {
+    uri_parse_unencoded(self.cwd_uri.join("$deno$repl.mts").unwrap().as_str())
+      .unwrap()
   }
 }
 
-fn lsp_range_to_span(text_info: &SourceTextInfo, range: &Range) -> Span {
-  Span::new(
-    text_info.byte_index(LineAndColumnIndex {
+fn lsp_range_to_std_range(
+  text_info: &SourceTextInfo,
+  range: &Range,
+) -> std::ops::Range<usize> {
+  let start_index = text_info
+    .loc_to_source_pos(LineAndColumnIndex {
       line_index: range.start.line as usize,
       column_index: range.start.character as usize,
-    }),
-    text_info.byte_index(LineAndColumnIndex {
+    })
+    .as_byte_index(text_info.range().start);
+  let end_index = text_info
+    .loc_to_source_pos(LineAndColumnIndex {
       line_index: range.end.line as usize,
       column_index: range.end.character as usize,
-    }),
-    Default::default(),
-  )
+    })
+    .as_byte_index(text_info.range().start);
+
+  start_index..end_index
 }
 
 fn get_cwd_uri() -> Result<ModuleSpecifier, AnyError> {
@@ -273,31 +299,62 @@ fn get_cwd_uri() -> Result<ModuleSpecifier, AnyError> {
 
 pub fn get_repl_workspace_settings() -> WorkspaceSettings {
   WorkspaceSettings {
-    enable: true,
-    enable_paths: Vec::new(),
+    enable: Some(true),
+    disable_paths: vec![],
+    enable_paths: None,
     config: None,
     certificate_stores: None,
     cache: None,
+    cache_on_save: false,
     import_map: None,
     code_lens: Default::default(),
     internal_debug: false,
+    internal_inspect: Default::default(),
+    log_file: false,
     lint: false,
+    document_preload_limit: 0, // don't pre-load any modules as it's expensive and not useful for the repl
     tls_certificate: None,
     unsafely_ignore_certificate_errors: None,
-    unstable: false,
-    suggest: CompletionSettings {
-      complete_function_calls: false,
-      names: false,
-      paths: false,
-      auto_imports: false,
+    unstable: Default::default(),
+    suggest: DenoCompletionSettings {
       imports: ImportCompletionSettings {
         auto_discover: false,
         hosts: HashMap::from([("https://deno.land".to_string(), true)]),
       },
     },
-    testing: TestingSettings {
-      args: vec![],
-      enable: false,
+    testing: TestingSettings { args: vec![] },
+    javascript: LanguageWorkspaceSettings {
+      suggest: CompletionSettings {
+        auto_imports: false,
+        class_member_snippets: ClassMemberSnippets { enabled: false },
+        complete_function_calls: false,
+        enabled: true,
+        include_automatic_optional_chain_completions: false,
+        include_completions_for_import_statements: true,
+        names: false,
+        object_literal_method_snippets: ObjectLiteralMethodSnippets {
+          enabled: false,
+        },
+        paths: false,
+      },
+      ..Default::default()
     },
+    typescript: LanguageWorkspaceSettings {
+      suggest: CompletionSettings {
+        auto_imports: false,
+        class_member_snippets: ClassMemberSnippets { enabled: false },
+        complete_function_calls: false,
+        enabled: true,
+        include_automatic_optional_chain_completions: false,
+        include_completions_for_import_statements: true,
+        names: false,
+        object_literal_method_snippets: ObjectLiteralMethodSnippets {
+          enabled: false,
+        },
+        paths: false,
+      },
+      ..Default::default()
+    },
+    tracing: Default::default(),
   }
 }

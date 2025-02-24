@@ -1,16 +1,16 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write --allow-run=cargo,git,deno --allow-net --no-check --lock=tools/deno.lock.json
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+#!/usr/bin/env -S deno run -A --lock=tools/deno.lock.json
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { DenoWorkspace } from "./deno_workspace.ts";
-import { GitLogOutput, path, semver } from "./deps.ts";
+import { $, GitLogOutput, semver } from "./deps.ts";
 
 const workspace = await DenoWorkspace.load();
 const repo = workspace.repo;
 const cliCrate = workspace.getCliCrate();
+const denoRtCrate = workspace.getDenoRtCrate();
+const denoLibCrate = workspace.getDenoLibCrate();
 const originalCliVersion = cliCrate.version;
 
-// update the std version used in the code
-console.log("Updating std version...");
-await updateStdVersion();
+await bumpCiCacheVersion();
 
 // increment the cli version
 if (Deno.args.some((a) => a === "--patch")) {
@@ -23,6 +23,9 @@ if (Deno.args.some((a) => a === "--patch")) {
   await cliCrate.promptAndIncrement();
 }
 
+denoRtCrate.setVersion(cliCrate.version);
+denoLibCrate.folderPath.join("version.txt").writeTextSync(cliCrate.version);
+
 // increment the dependency crate versions
 for (const crate of workspace.getCliDependencyCrates()) {
   await crate.increment("minor");
@@ -33,12 +36,12 @@ await workspace.getCliCrate().cargoUpdate("--workspace");
 
 // try to update the Releases.md markdown text
 try {
-  console.log("Updating Releases.md...");
+  $.logStep("Updating Releases.md...");
   await updateReleasesMd();
 } catch (err) {
-  console.error(err);
-  console.error(
-    "Updating Releases.md failed. Please manually run " +
+  $.log(err);
+  $.logError(
+    "Error Updating Releases.md failed. Please manually run " +
       "`git log --oneline VERSION_FROM..VERSION_TO` and " +
       "use the output to update Releases.md",
   );
@@ -96,25 +99,24 @@ async function getGitLog() {
   }
 }
 
-async function updateStdVersion() {
-  const newStdVersion = await getLatestStdVersion();
-  const compatFilePath = path.join(cliCrate.folderPath, "compat/mod.rs");
-  const text = Deno.readTextFileSync(compatFilePath);
-  Deno.writeTextFileSync(
-    compatFilePath,
-    text.replace(/std@[0-9]+\.[0-9]+\.[0-9]+/, `std@${newStdVersion}`),
+async function bumpCiCacheVersion() {
+  const generateScript = workspace.repo.folderPath.join(
+    ".github/workflows/ci.generate.ts",
   );
-}
-
-async function getLatestStdVersion() {
-  const url =
-    "https://raw.githubusercontent.com/denoland/deno_std/main/version.ts";
-  const result = await fetch(url);
-  const text = await result.text();
-  const version = /"([0-9]+\.[0-9]+\.[0-9]+)"/.exec(text);
+  const fileText = generateScript.readTextSync();
+  const cacheVersionRegex = /const cacheVersion = ([0-9]+);/;
+  const version = fileText.match(cacheVersionRegex)?.[1];
   if (version == null) {
-    throw new Error(`Could not find version in text: ${text}`);
-  } else {
-    return version[1];
+    throw new Error("Could not find cache version in text.");
   }
+  const toVersion = parseInt(version, 10) + 1;
+  $.logStep(`Bumping cache version from ${version} to ${toVersion}...`);
+  const newText = fileText.replace(
+    cacheVersionRegex,
+    `const cacheVersion = ${toVersion};`,
+  );
+  generateScript.writeTextSync(newText);
+
+  // run the script
+  await $`${generateScript}`;
 }
