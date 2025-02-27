@@ -1,107 +1,153 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::AnyError;
-use deno_core::op;
-use deno_core::OpState;
-use deno_core::Resource;
-use deno_core::ResourceId;
-use deno_core::ZeroCopyBuf;
+use std::cell::RefCell;
+use std::io::Write;
+
+use deno_core::op2;
+use flate2::write::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use flate2::write::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::write::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::io::Write;
-use std::rc::Rc;
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum CompressionError {
+  #[class(type)]
+  #[error("Unsupported format")]
+  UnsupportedFormat,
+  #[class(type)]
+  #[error("resource is closed")]
+  ResourceClosed,
+  #[class(type)]
+  #[error(transparent)]
+  IoTypeError(std::io::Error),
+  #[class(inherit)]
+  #[error(transparent)]
+  Io(std::io::Error),
+}
 
 #[derive(Debug)]
-struct CompressionResource(RefCell<Inner>);
+struct CompressionResource(RefCell<Option<Inner>>);
 
+impl deno_core::GarbageCollected for CompressionResource {}
+
+/// https://wicg.github.io/compression/#supported-formats
 #[derive(Debug)]
 enum Inner {
   DeflateDecoder(ZlibDecoder<Vec<u8>>),
   DeflateEncoder(ZlibEncoder<Vec<u8>>),
+  DeflateRawDecoder(DeflateDecoder<Vec<u8>>),
+  DeflateRawEncoder(DeflateEncoder<Vec<u8>>),
   GzDecoder(GzDecoder<Vec<u8>>),
   GzEncoder(GzEncoder<Vec<u8>>),
 }
 
-impl Resource for CompressionResource {
-  fn name(&self) -> Cow<str> {
-    "compression".into()
-  }
-}
-
-#[op]
+#[op2]
+#[cppgc]
 pub fn op_compression_new(
-  state: &mut OpState,
-  format: String,
+  #[string] format: &str,
   is_decoder: bool,
-) -> Result<ResourceId, AnyError> {
+) -> Result<CompressionResource, CompressionError> {
   let w = Vec::new();
-  let inner = match (format.as_str(), is_decoder) {
+  let inner = match (format, is_decoder) {
     ("deflate", true) => Inner::DeflateDecoder(ZlibDecoder::new(w)),
     ("deflate", false) => {
       Inner::DeflateEncoder(ZlibEncoder::new(w, Compression::default()))
+    }
+    ("deflate-raw", true) => Inner::DeflateRawDecoder(DeflateDecoder::new(w)),
+    ("deflate-raw", false) => {
+      Inner::DeflateRawEncoder(DeflateEncoder::new(w, Compression::default()))
     }
     ("gzip", true) => Inner::GzDecoder(GzDecoder::new(w)),
     ("gzip", false) => {
       Inner::GzEncoder(GzEncoder::new(w, Compression::default()))
     }
-    _ => unreachable!(),
+    _ => return Err(CompressionError::UnsupportedFormat),
   };
-  let resource = CompressionResource(RefCell::new(inner));
-  Ok(state.resource_table.add(resource))
+  Ok(CompressionResource(RefCell::new(Some(inner))))
 }
 
-#[op]
+#[op2]
+#[buffer]
 pub fn op_compression_write(
-  state: &mut OpState,
-  rid: ResourceId,
-  input: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
-  let resource = state.resource_table.get::<CompressionResource>(rid)?;
+  #[cppgc] resource: &CompressionResource,
+  #[anybuffer] input: &[u8],
+) -> Result<Vec<u8>, CompressionError> {
   let mut inner = resource.0.borrow_mut();
+  let inner = inner.as_mut().ok_or(CompressionError::ResourceClosed)?;
   let out: Vec<u8> = match &mut *inner {
     Inner::DeflateDecoder(d) => {
-      d.write_all(&input)?;
-      d.flush()?;
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
       d.get_mut().drain(..)
     }
     Inner::DeflateEncoder(d) => {
-      d.write_all(&input)?;
-      d.flush()?;
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
+      d.get_mut().drain(..)
+    }
+    Inner::DeflateRawDecoder(d) => {
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
+      d.get_mut().drain(..)
+    }
+    Inner::DeflateRawEncoder(d) => {
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
       d.get_mut().drain(..)
     }
     Inner::GzDecoder(d) => {
-      d.write_all(&input)?;
-      d.flush()?;
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
       d.get_mut().drain(..)
     }
     Inner::GzEncoder(d) => {
-      d.write_all(&input)?;
-      d.flush()?;
+      d.write_all(input).map_err(CompressionError::IoTypeError)?;
+      d.flush().map_err(CompressionError::Io)?;
       d.get_mut().drain(..)
     }
   }
   .collect();
-  Ok(out.into())
+  Ok(out)
 }
 
-#[op]
+#[op2]
+#[buffer]
 pub fn op_compression_finish(
-  state: &mut OpState,
-  rid: ResourceId,
-) -> Result<ZeroCopyBuf, AnyError> {
-  let resource = state.resource_table.take::<CompressionResource>(rid)?;
-  let resource = Rc::try_unwrap(resource).unwrap();
-  let inner = resource.0.into_inner();
-  let out: Vec<u8> = match inner {
-    Inner::DeflateDecoder(d) => d.finish()?,
-    Inner::DeflateEncoder(d) => d.finish()?,
-    Inner::GzDecoder(d) => d.finish()?,
-    Inner::GzEncoder(d) => d.finish()?,
+  #[cppgc] resource: &CompressionResource,
+  report_errors: bool,
+) -> Result<Vec<u8>, CompressionError> {
+  let inner = resource
+    .0
+    .borrow_mut()
+    .take()
+    .ok_or(CompressionError::ResourceClosed)?;
+  let out = match inner {
+    Inner::DeflateDecoder(d) => {
+      d.finish().map_err(CompressionError::IoTypeError)
+    }
+    Inner::DeflateEncoder(d) => {
+      d.finish().map_err(CompressionError::IoTypeError)
+    }
+    Inner::DeflateRawDecoder(d) => {
+      d.finish().map_err(CompressionError::IoTypeError)
+    }
+    Inner::DeflateRawEncoder(d) => {
+      d.finish().map_err(CompressionError::IoTypeError)
+    }
+    Inner::GzDecoder(d) => d.finish().map_err(CompressionError::IoTypeError),
+    Inner::GzEncoder(d) => d.finish().map_err(CompressionError::IoTypeError),
   };
-  Ok(out.into())
+  match out {
+    Err(err) => {
+      if report_errors {
+        Err(err)
+      } else {
+        Ok(Vec::with_capacity(0))
+      }
+    }
+    Ok(out) => Ok(out),
+  }
 }

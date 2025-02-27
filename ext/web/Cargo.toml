@@ -1,32 +1,42 @@
-# Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+# Copyright 2018-2025 the Deno authors. MIT license.
 
 [package]
 name = "deno_web"
-version = "0.78.0"
-authors = ["the Deno authors"]
-edition = "2021"
-license = "MIT"
+version = "0.224.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
 readme = "README.md"
-repository = "https://github.com/denoland/deno"
+repository.workspace = true
 description = "Collection of Web APIs"
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-async-trait = "0.1.51"
-base64 = "0.13.0"
-deno_core = { version = "0.129.0", path = "../../core" }
-encoding_rs = "0.8.29"
-flate2 = "1"
-serde = "1.0.129"
-tokio = { version = "1.17", features = ["full"] }
-uuid = { version = "0.8.2", features = ["v4", "serde"] }
+async-trait.workspace = true
+base64-simd.workspace = true
+bytes.workspace = true
+deno_core.workspace = true
+deno_error.workspace = true
+deno_permissions.workspace = true
+encoding_rs.workspace = true
+flate2 = { workspace = true, features = ["default"] }
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-deno_bench_util = { version = "0.41.0", path = "../../bench_util" }
-deno_url = { version = "0.47.0", path = "../url" }
-deno_webidl = { version = "0.47.0", path = "../webidl" }
+deno_bench_util.workspace = true
+deno_console.workspace = true
+deno_url.workspace = true
+deno_webidl.workspace = true
+
+[[bench]]
+name = "encoding"
+harness = false
 
 [[bench]]
 name = "timers_ops"

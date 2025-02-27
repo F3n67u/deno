@@ -1,5 +1,8 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
-use bencher::{DynBenchFn, StaticBenchFn, TestDescAndFn, TestOpts};
+// Copyright 2018-2025 the Deno authors. MIT license.
+use bencher::DynBenchFn;
+use bencher::StaticBenchFn;
+use bencher::TestDescAndFn;
+use bencher::TestOpts;
 
 pub fn is_profiling() -> bool {
   std::env::var("PROFILING").is_ok()
@@ -23,7 +26,7 @@ macro_rules! bench_or_profile {
       )+
 
       if $crate::is_profiling() {
-        // Run profling
+        // Run profiling
         $crate::run_profiles(&test_opts, benches);
       } else {
         // Run benches
@@ -36,6 +39,7 @@ macro_rules! bench_or_profile {
   };
 }
 
+#[allow(clippy::print_stdout)]
 pub fn run_profiles(opts: &TestOpts, tests: Vec<TestDescAndFn>) {
   let tests = filter_tests(opts, tests);
   // let decs = tests.iter().map(|t| t.desc.clone()).collect();

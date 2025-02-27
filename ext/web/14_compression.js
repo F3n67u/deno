@@ -1,131 +1,163 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="../../core/lib.deno_core.d.ts" />
 /// <reference path="./internal.d.ts" />
-/// <reference path="./lib.deno_web.d.ts" />
+/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
 
-"use strict";
+import { primordials } from "ext:core/mod.js";
+import {
+  op_compression_finish,
+  op_compression_new,
+  op_compression_write,
+} from "ext:core/ops";
+const {
+  SymbolFor,
+  ObjectPrototypeIsPrototypeOf,
+  TypedArrayPrototypeGetByteLength,
+} = primordials;
 
-((window) => {
-  const core = window.Deno.core;
-  const webidl = window.__bootstrap.webidl;
-  const { TransformStream } = window.__bootstrap.streams;
+import * as webidl from "ext:deno_webidl/00_webidl.js";
+import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
+import { TransformStream } from "./06_streams.js";
 
-  webidl.converters.CompressionFormat = webidl.createEnumConverter(
-    "CompressionFormat",
-    [
-      "deflate",
-      "gzip",
-    ],
-  );
+webidl.converters.CompressionFormat = webidl.createEnumConverter(
+  "CompressionFormat",
+  [
+    "deflate",
+    "deflate-raw",
+    "gzip",
+  ],
+);
 
-  class CompressionStream {
-    #transform;
+class CompressionStream {
+  #transform;
 
-    constructor(format) {
-      const prefix = "Failed to construct 'CompressionStream'";
-      webidl.requiredArguments(arguments.length, 1, { prefix });
-      format = webidl.converters.CompressionFormat(format, {
-        prefix,
-        context: "Argument 1",
-      });
+  constructor(format) {
+    const prefix = "Failed to construct 'CompressionStream'";
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    format = webidl.converters.CompressionFormat(format, prefix, "Argument 1");
 
-      const rid = core.opSync("op_compression_new", format, false);
+    const rid = op_compression_new(format, false);
 
-      this.#transform = new TransformStream({
-        transform(chunk, controller) {
-          chunk = webidl.converters.BufferSource(chunk, {
-            prefix,
-            context: "chunk",
-          });
-          const output = core.opSync(
-            "op_compression_write",
-            rid,
-            chunk,
-          );
-          maybeEnqueue(controller, output);
-        },
-        flush(controller) {
-          const output = core.opSync("op_compression_finish", rid);
-          maybeEnqueue(controller, output);
-        },
-      });
+    this.#transform = new TransformStream({
+      transform(chunk, controller) {
+        chunk = webidl.converters.BufferSource(chunk, prefix, "chunk");
+        const output = op_compression_write(
+          rid,
+          chunk,
+        );
+        maybeEnqueue(controller, output);
+      },
+      flush(controller) {
+        const output = op_compression_finish(rid, true);
+        maybeEnqueue(controller, output);
+      },
+      cancel: (_reason) => {
+        op_compression_finish(rid, false);
+      },
+    });
 
-      this[webidl.brand] = webidl.brand;
-    }
-
-    get readable() {
-      webidl.assertBranded(this, CompressionStreamPrototype);
-      return this.#transform.readable;
-    }
-
-    get writable() {
-      webidl.assertBranded(this, CompressionStreamPrototype);
-      return this.#transform.writable;
-    }
+    this[webidl.brand] = webidl.brand;
   }
 
-  webidl.configurePrototype(CompressionStream);
-  const CompressionStreamPrototype = CompressionStream.prototype;
-
-  class DecompressionStream {
-    #transform;
-
-    constructor(format) {
-      const prefix = "Failed to construct 'DecompressionStream'";
-      webidl.requiredArguments(arguments.length, 1, { prefix });
-      format = webidl.converters.CompressionFormat(format, {
-        prefix,
-        context: "Argument 1",
-      });
-
-      const rid = core.opSync("op_compression_new", format, true);
-
-      this.#transform = new TransformStream({
-        transform(chunk, controller) {
-          chunk = webidl.converters.BufferSource(chunk, {
-            prefix,
-            context: "chunk",
-          });
-          const output = core.opSync(
-            "op_compression_write",
-            rid,
-            chunk,
-          );
-          maybeEnqueue(controller, output);
-        },
-        flush(controller) {
-          const output = core.opSync("op_compression_finish", rid);
-          maybeEnqueue(controller, output);
-        },
-      });
-
-      this[webidl.brand] = webidl.brand;
-    }
-
-    get readable() {
-      webidl.assertBranded(this, DecompressionStreamPrototype);
-      return this.#transform.readable;
-    }
-
-    get writable() {
-      webidl.assertBranded(this, DecompressionStreamPrototype);
-      return this.#transform.writable;
-    }
+  get readable() {
+    webidl.assertBranded(this, CompressionStreamPrototype);
+    return this.#transform.readable;
   }
 
-  function maybeEnqueue(controller, output) {
-    if (output && output.byteLength > 0) {
-      controller.enqueue(output);
-    }
+  get writable() {
+    webidl.assertBranded(this, CompressionStreamPrototype);
+    return this.#transform.writable;
   }
 
-  webidl.configurePrototype(DecompressionStream);
-  const DecompressionStreamPrototype = DecompressionStream.prototype;
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(
+          CompressionStreamPrototype,
+          this,
+        ),
+        keys: [
+          "readable",
+          "writable",
+        ],
+      }),
+      inspectOptions,
+    );
+  }
+}
 
-  window.__bootstrap.compression = {
-    CompressionStream,
-    DecompressionStream,
-  };
-})(globalThis);
+webidl.configureInterface(CompressionStream);
+const CompressionStreamPrototype = CompressionStream.prototype;
+
+class DecompressionStream {
+  #transform;
+
+  constructor(format) {
+    const prefix = "Failed to construct 'DecompressionStream'";
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    format = webidl.converters.CompressionFormat(format, prefix, "Argument 1");
+
+    const rid = op_compression_new(format, true);
+
+    this.#transform = new TransformStream({
+      transform(chunk, controller) {
+        chunk = webidl.converters.BufferSource(chunk, prefix, "chunk");
+        const output = op_compression_write(
+          rid,
+          chunk,
+        );
+        maybeEnqueue(controller, output);
+      },
+      flush(controller) {
+        const output = op_compression_finish(rid, true);
+        maybeEnqueue(controller, output);
+      },
+      cancel: (_reason) => {
+        op_compression_finish(rid, false);
+      },
+    });
+
+    this[webidl.brand] = webidl.brand;
+  }
+
+  get readable() {
+    webidl.assertBranded(this, DecompressionStreamPrototype);
+    return this.#transform.readable;
+  }
+
+  get writable() {
+    webidl.assertBranded(this, DecompressionStreamPrototype);
+    return this.#transform.writable;
+  }
+
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(
+          DecompressionStreamPrototype,
+          this,
+        ),
+        keys: [
+          "readable",
+          "writable",
+        ],
+      }),
+      inspectOptions,
+    );
+  }
+}
+
+function maybeEnqueue(controller, output) {
+  if (output && TypedArrayPrototypeGetByteLength(output) > 0) {
+    controller.enqueue(output);
+  }
+}
+
+webidl.configureInterface(DecompressionStream);
+const DecompressionStreamPrototype = DecompressionStream.prototype;
+
+export { CompressionStream, DecompressionStream };

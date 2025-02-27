@@ -1,127 +1,40 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::cache::CacherLoader;
-use crate::cache::FetchCacher;
-use crate::config_file::ConfigFile;
-use crate::flags::Flags;
-use crate::graph_util::graph_valid;
-use crate::http_cache;
-use crate::proc_state::ProcState;
-use crate::resolver::ImportMapResolver;
-use crate::resolver::JsxResolver;
-
-use deno_core::anyhow::anyhow;
-use deno_core::error::AnyError;
-use deno_core::parking_lot::Mutex;
-use deno_core::ModuleSpecifier;
-use deno_runtime::permissions::Permissions;
-use deno_runtime::tokio_util::create_basic_runtime;
-use import_map::ImportMap;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 use std::time::SystemTime;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 
-type Request = (
-  Vec<(ModuleSpecifier, deno_graph::ModuleKind)>,
-  oneshot::Sender<Result<(), AnyError>>,
-);
+use deno_core::url::Url;
+use deno_core::ModuleSpecifier;
+use deno_path_util::url_to_file_path;
 
-/// A "server" that handles requests from the language server to cache modules
-/// in its own thread.
-#[derive(Debug)]
-pub struct CacheServer(mpsc::UnboundedSender<Request>);
+use crate::cache::DenoDir;
+use crate::cache::GlobalHttpCache;
+use crate::cache::HttpCache;
+use crate::cache::LocalLspHttpCache;
+use crate::lsp::config::Config;
+use crate::lsp::logging::lsp_log;
+use crate::lsp::logging::lsp_warn;
+use crate::sys::CliSys;
 
-impl CacheServer {
-  pub async fn new(
-    maybe_cache_path: Option<PathBuf>,
-    maybe_import_map: Option<Arc<ImportMap>>,
-    maybe_config_file: Option<ConfigFile>,
-    maybe_ca_stores: Option<Vec<String>>,
-    maybe_ca_file: Option<String>,
-    unsafely_ignore_certificate_errors: Option<Vec<String>>,
-  ) -> Self {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
-    let _join_handle = thread::spawn(move || {
-      let runtime = create_basic_runtime();
-      runtime.block_on(async {
-        let ps = ProcState::build(Arc::new(Flags {
-          cache_path: maybe_cache_path,
-          ca_stores: maybe_ca_stores,
-          ca_file: maybe_ca_file,
-          unsafely_ignore_certificate_errors,
-          ..Default::default()
-        }))
-        .await
-        .unwrap();
-        let maybe_import_map_resolver =
-          maybe_import_map.map(ImportMapResolver::new);
-        let maybe_jsx_resolver = maybe_config_file.as_ref().and_then(|cf| {
-          cf.to_maybe_jsx_import_source_module()
-            .map(|im| JsxResolver::new(im, maybe_import_map_resolver.clone()))
-        });
-        let maybe_resolver = if maybe_jsx_resolver.is_some() {
-          maybe_jsx_resolver.as_ref().map(|jr| jr.as_resolver())
-        } else {
-          maybe_import_map_resolver
-            .as_ref()
-            .map(|im| im.as_resolver())
-        };
-        let maybe_imports = maybe_config_file
-          .and_then(|cf| cf.to_maybe_imports().ok())
-          .flatten();
-        let mut cache = FetchCacher::new(
-          ps.dir.gen_cache.clone(),
-          ps.file_fetcher.clone(),
-          Permissions::allow_all(),
-          Permissions::allow_all(),
-        );
-
-        while let Some((roots, tx)) = rx.recv().await {
-          let graph = deno_graph::create_graph(
-            roots,
-            false,
-            maybe_imports.clone(),
-            cache.as_mut_loader(),
-            maybe_resolver,
-            None,
-            None,
-            None,
-          )
-          .await;
-
-          if tx.send(graph_valid(&graph, true, false)).is_err() {
-            log::warn!("cannot send to client");
-          }
-        }
-      })
-    });
-
-    Self(tx)
-  }
-
-  /// Attempt to cache the supplied module specifiers and their dependencies in
-  /// the current DENO_DIR, returning any errors, so they can be returned to the
-  /// client.
-  pub async fn cache(
-    &self,
-    roots: Vec<(ModuleSpecifier, deno_graph::ModuleKind)>,
-  ) -> Result<(), AnyError> {
-    let (tx, rx) = oneshot::channel::<Result<(), AnyError>>();
-    if self.0.send((roots, tx)).is_err() {
-      return Err(anyhow!("failed to send request to cache thread"));
-    }
-    rx.await?
+pub fn calculate_fs_version(
+  cache: &LspCache,
+  specifier: &ModuleSpecifier,
+  file_referrer: Option<&ModuleSpecifier>,
+) -> Option<String> {
+  match specifier.scheme() {
+    "npm" | "node" | "data" | "blob" => None,
+    "file" => url_to_file_path(specifier)
+      .ok()
+      .and_then(|path| calculate_fs_version_at_path(&path)),
+    _ => calculate_fs_version_in_cache(cache, specifier, file_referrer),
   }
 }
 
 /// Calculate a version for for a given path.
-pub fn calculate_fs_version(path: &Path) -> Option<String> {
+pub fn calculate_fs_version_at_path(path: &Path) -> Option<String> {
   let metadata = fs::metadata(path).ok()?;
   if let Ok(modified) = metadata.modified() {
     if let Ok(n) = modified.duration_since(SystemTime::UNIX_EPOCH) {
@@ -134,81 +47,143 @@ pub fn calculate_fs_version(path: &Path) -> Option<String> {
   }
 }
 
-/// Populate the metadata map based on the supplied headers
-fn parse_metadata(
-  headers: &HashMap<String, String>,
-) -> HashMap<MetadataKey, String> {
-  let mut metadata = HashMap::new();
-  if let Some(warning) = headers.get("x-deno-warning").cloned() {
-    metadata.insert(MetadataKey::Warning, warning);
+fn calculate_fs_version_in_cache(
+  cache: &LspCache,
+  specifier: &ModuleSpecifier,
+  file_referrer: Option<&ModuleSpecifier>,
+) -> Option<String> {
+  let http_cache = cache.for_specifier(file_referrer);
+  let Ok(cache_key) = http_cache.cache_item_key(specifier) else {
+    return Some("1".to_string());
+  };
+  match http_cache.read_modified_time(&cache_key) {
+    Ok(Some(modified)) => {
+      match modified.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(n) => Some(n.as_millis().to_string()),
+        Err(_) => Some("1".to_string()),
+      }
+    }
+    Ok(None) => None,
+    Err(_) => Some("1".to_string()),
   }
-  metadata
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum MetadataKey {
-  /// Represent the `x-deno-warning` header associated with the document
-  Warning,
 }
 
 #[derive(Debug, Clone)]
-struct Metadata {
-  values: Arc<HashMap<MetadataKey, String>>,
-  version: Option<String>,
+pub struct LspCache {
+  deno_dir: DenoDir,
+  global: Arc<GlobalHttpCache>,
+  vendors_by_scope: BTreeMap<ModuleSpecifier, Option<Arc<LocalLspHttpCache>>>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct CacheMetadata {
-  cache: http_cache::HttpCache,
-  metadata: Arc<Mutex<HashMap<ModuleSpecifier, Metadata>>>,
+impl Default for LspCache {
+  fn default() -> Self {
+    Self::new(None)
+  }
 }
 
-impl CacheMetadata {
-  pub fn new(location: &Path) -> Self {
+impl LspCache {
+  pub fn new(global_cache_url: Option<Url>) -> Self {
+    let global_cache_path = global_cache_url.and_then(|s| {
+      url_to_file_path(&s)
+        .inspect(|p| {
+          lsp_log!("Resolved global cache path: \"{}\"", p.to_string_lossy());
+        })
+        .inspect_err(|err| {
+          lsp_warn!("Failed to resolve custom cache path: {err}");
+        })
+        .ok()
+    });
+    let sys = CliSys::default();
+    let deno_dir_root =
+      deno_cache_dir::resolve_deno_dir(&sys, global_cache_path)
+        .expect("should be infallible with absolute custom root");
+    let deno_dir = DenoDir::new(sys.clone(), deno_dir_root);
+    let global =
+      Arc::new(GlobalHttpCache::new(sys, deno_dir.remote_folder_path()));
     Self {
-      cache: http_cache::HttpCache::new(location),
-      metadata: Default::default(),
+      deno_dir,
+      global,
+      vendors_by_scope: Default::default(),
     }
   }
 
-  /// Return the meta data associated with the specifier. Unlike the `get()`
-  /// method, redirects of the supplied specifier will not be followed.
-  pub fn get(
+  pub fn update_config(&mut self, config: &Config) {
+    self.vendors_by_scope = config
+      .tree
+      .data_by_scope()
+      .iter()
+      .map(|(scope, config_data)| {
+        (
+          scope.clone(),
+          config_data.vendor_dir.as_ref().map(|v| {
+            Arc::new(LocalLspHttpCache::new(v.clone(), self.global.clone()))
+          }),
+        )
+      })
+      .collect();
+  }
+
+  pub fn deno_dir(&self) -> &DenoDir {
+    &self.deno_dir
+  }
+
+  pub fn global(&self) -> &Arc<GlobalHttpCache> {
+    &self.global
+  }
+
+  pub fn for_specifier(
+    &self,
+    file_referrer: Option<&ModuleSpecifier>,
+  ) -> Arc<dyn HttpCache> {
+    let Some(file_referrer) = file_referrer else {
+      return self.global.clone();
+    };
+    self
+      .vendors_by_scope
+      .iter()
+      .rfind(|(s, _)| file_referrer.as_str().starts_with(s.as_str()))
+      .and_then(|(_, v)| v.clone().map(|v| v as _))
+      .unwrap_or(self.global.clone() as _)
+  }
+
+  pub fn vendored_specifier(
     &self,
     specifier: &ModuleSpecifier,
-  ) -> Option<Arc<HashMap<MetadataKey, String>>> {
-    if specifier.scheme() == "file" {
+    file_referrer: Option<&ModuleSpecifier>,
+  ) -> Option<ModuleSpecifier> {
+    let file_referrer = file_referrer?;
+    if !matches!(specifier.scheme(), "http" | "https") {
       return None;
     }
-    let version = self
-      .cache
-      .get_cache_filename(specifier)
-      .and_then(|ref path| calculate_fs_version(path));
-    let metadata = self.metadata.lock().get(specifier).cloned();
-    if metadata.as_ref().and_then(|m| m.version.clone()) != version {
-      self.refresh(specifier).map(|m| m.values)
-    } else {
-      metadata.map(|m| m.values)
-    }
+    let vendor = self
+      .vendors_by_scope
+      .iter()
+      .rfind(|(s, _)| file_referrer.as_str().starts_with(s.as_str()))?
+      .1
+      .as_ref()?;
+    vendor.get_file_url(specifier)
   }
 
-  fn refresh(&self, specifier: &ModuleSpecifier) -> Option<Metadata> {
-    if specifier.scheme() == "file" {
-      return None;
-    }
-    let cache_filename = self.cache.get_cache_filename(specifier)?;
-    let specifier_metadata =
-      http_cache::Metadata::read(&cache_filename).ok()?;
-    let values = Arc::new(parse_metadata(&specifier_metadata.headers));
-    let version = calculate_fs_version(&cache_filename);
-    let mut metadata_map = self.metadata.lock();
-    let metadata = Metadata { values, version };
-    metadata_map.insert(specifier.clone(), metadata.clone());
-    Some(metadata)
+  pub fn unvendored_specifier(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Option<ModuleSpecifier> {
+    let path = url_to_file_path(specifier).ok()?;
+    let vendor = self
+      .vendors_by_scope
+      .iter()
+      .rfind(|(s, _)| specifier.as_str().starts_with(s.as_str()))?
+      .1
+      .as_ref()?;
+    vendor.get_remote_url(&path)
   }
 
-  pub fn set_location(&mut self, location: &Path) {
-    self.cache = http_cache::HttpCache::new(location);
-    self.metadata.lock().clear();
+  pub fn is_valid_file_referrer(&self, specifier: &ModuleSpecifier) -> bool {
+    if let Ok(path) = url_to_file_path(specifier) {
+      if !path.starts_with(&self.deno_dir().root) {
+        return true;
+      }
+    }
+    false
   }
 }

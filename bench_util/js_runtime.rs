@@ -1,8 +1,9 @@
-// Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 use bencher::Bencher;
 use deno_core::v8;
 use deno_core::Extension;
 use deno_core::JsRuntime;
+use deno_core::PollEventLoopOptions;
 use deno_core::RuntimeOptions;
 
 use crate::profiling::is_profiling;
@@ -10,12 +11,13 @@ use crate::profiling::is_profiling;
 pub fn create_js_runtime(setup: impl FnOnce() -> Vec<Extension>) -> JsRuntime {
   JsRuntime::new(RuntimeOptions {
     extensions: setup(),
+    module_loader: None,
     ..Default::default()
   })
 }
 
 fn loop_code(iters: u64, src: &str) -> String {
-  format!(r#"for(let i=0; i < {}; i++) {{ {} }}"#, iters, src,)
+  format!(r#"for(let i=0; i < {iters}; i++) {{ {src} }}"#,)
 }
 
 #[derive(Copy, Clone)]
@@ -63,7 +65,6 @@ pub fn bench_js_sync_with(
 
   let code = v8::String::new(scope, looped_src.as_ref()).unwrap();
   let script = v8::Script::compile(scope, code, None).unwrap();
-
   // Run once if profiling, otherwise regular bench loop
   if is_profiling() {
     script.run(scope).unwrap();
@@ -101,8 +102,8 @@ pub fn bench_js_async_with(
     opts.benching_inner
   };
   let looped = loop_code(inner_iters, src);
-  let src = looped.as_ref();
-
+  // Get a &'static str by leaking -- this is fine because it's benchmarking code
+  let src = Box::leak(looped.into_boxed_str());
   if is_profiling() {
     for _ in 0..opts.profiling_outer {
       tokio_runtime.block_on(inner_async(src, &mut runtime));
@@ -114,7 +115,10 @@ pub fn bench_js_async_with(
   }
 }
 
-async fn inner_async(src: &str, runtime: &mut JsRuntime) {
+async fn inner_async(src: &'static str, runtime: &mut JsRuntime) {
   runtime.execute_script("inner_loop", src).unwrap();
-  runtime.run_event_loop(false).await.unwrap();
+  runtime
+    .run_event_loop(PollEventLoopOptions::default())
+    .await
+    .unwrap();
 }
